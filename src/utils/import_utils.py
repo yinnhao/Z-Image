@@ -4,7 +4,11 @@ import torch
 
 
 def is_flash_attn_available():
-    return importlib.util.find_spec("flash_attn") is not None
+    try:
+        from flash_attn import flash_attn_func
+        return flash_attn_func is not None
+    except (ImportError, AttributeError):
+        return False
 
 
 def is_flash_attn_3_available():

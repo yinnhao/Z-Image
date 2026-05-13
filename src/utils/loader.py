@@ -178,8 +178,7 @@ def load_from_local_dir(
     text_encoder_dir = model_dir / "text_encoder"
     text_encoder = AutoModel.from_pretrained(
         str(text_encoder_dir),
-        # torch_dtype=dtype, # some version use this
-        dtype=dtype,
+        torch_dtype=dtype,
         trust_remote_code=True,
     )
     text_encoder.to(device)
