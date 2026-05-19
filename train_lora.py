@@ -39,7 +39,7 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 
 class TrainConfig:
-    model_path = "ckpts/Z-Image-Turbo"
+    model_path = "ckpts/Z-Image"
     dataset_name = "linoyts/3d_icon"
     output_dir = "output/lora_3d_icon"
     cache_dir = "output/precomputed"
@@ -47,9 +47,9 @@ class TrainConfig:
     resolution = 512
     batch_size = 1
     gradient_accumulation_steps = 4
-    learning_rate = 2e-4
-    epochs = 100
-    warmup_steps = 50
+    learning_rate = 1e-4
+    epochs = 500
+    warmup_steps = 100
     save_every_steps = 500
     log_every_steps = 10
     validate_every_steps = 100
@@ -427,8 +427,8 @@ def train(config: TrainConfig):
                             prompt=config.validate_prompt,
                             height=config.resolution,
                             width=config.resolution,
-                            num_inference_steps=8,
-                            guidance_scale=0.0,
+                            num_inference_steps=30,
+                            guidance_scale=3.5,
                             generator=val_generator,
                         )
                     # Log image to TensorBoard
@@ -497,8 +497,8 @@ def inference(config: TrainConfig, lora_path: str, prompt: str = None):
         prompt=prompt,
         height=config.resolution,
         width=config.resolution,
-        num_inference_steps=8,
-        guidance_scale=0.0,
+        num_inference_steps=30,
+        guidance_scale=3.5,
         generator=generator,
     )
 
