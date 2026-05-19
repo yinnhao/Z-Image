@@ -481,34 +481,47 @@ def inference(config: TrainConfig, lora_path: str, prompt: str = None):
     transformer = transformer.merge_and_unload()
     transformer.eval()
 
+    # Determine prompts to generate
+    if prompt is not None:
+        prompts = [prompt]
+    else:
+        # Use all training set prompts as test set
+        prompts_file = Path(config.cache_dir) / "prompts.json"
+        if prompts_file.exists():
+            with open(prompts_file) as f:
+                prompts = json.load(f)
+            logger.info(f"Using all {len(prompts)} training prompts as test set")
+        else:
+            prompts = ["a 3dicon, a cute cat icon on a purple background"]
+
     # Generate
-    if prompt is None:
-        prompt = "a 3dicon, a cute cat icon on a purple background"
-
-    logger.info(f"Generating with prompt: {prompt}")
-    generator = torch.Generator(device).manual_seed(config.seed)
-
-    images = generate(
-        transformer=transformer,
-        vae=vae,
-        text_encoder=text_encoder,
-        tokenizer=tokenizer,
-        scheduler=scheduler,
-        prompt=prompt,
-        height=config.resolution,
-        width=config.resolution,
-        num_inference_steps=30,
-        guidance_scale=3.5,
-        generator=generator,
-    )
-
-    # Save
     output_dir = Path(config.output_dir) / "samples"
     output_dir.mkdir(parents=True, exist_ok=True)
-    for i, img in enumerate(images):
-        save_path = output_dir / f"lora_sample_{i}.png"
-        img.save(save_path)
-        logger.info(f"Saved: {save_path}")
+
+    for i, p in enumerate(prompts):
+        logger.info(f"[{i+1}/{len(prompts)}] Generating: {p}")
+        generator = torch.Generator(device).manual_seed(config.seed)
+
+        images = generate(
+            transformer=transformer,
+            vae=vae,
+            text_encoder=text_encoder,
+            tokenizer=tokenizer,
+            scheduler=scheduler,
+            prompt=p,
+            height=config.resolution,
+            width=config.resolution,
+            num_inference_steps=30,
+            guidance_scale=3.5,
+            generator=generator,
+        )
+
+        short_name = p.replace("a 3dicon, ", "").replace(" ", "_")[:40]
+        save_path = output_dir / f"{i:02d}_{short_name}.png"
+        images[0].save(save_path)
+        logger.info(f"  Saved: {save_path}")
+
+    logger.info(f"All samples saved to {output_dir}/")
 
 
 # ============================================================================
