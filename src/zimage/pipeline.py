@@ -86,11 +86,11 @@ def generate(
     device = next(transformer.parameters()).device
 
     if hasattr(vae, "config") and hasattr(vae.config, "block_out_channels"):
-        vae_scale_factor = 2 ** (len(vae.config.block_out_channels) - 1)
+        vae_scale_factor = 2 ** (len(vae.config.block_out_channels) - 1) # vae encoder最后一层只做特征变换，不做下采样
     else:
-        vae_scale_factor = 8
-    vae_scale = vae_scale_factor * 2
-
+        vae_scale_factor = 8 # 如果拿不到 VAE 配置，就默认按常见的 8 倍下采样处理。
+    vae_scale = vae_scale_factor * 2 # VAE latent 空间还会被 transformer 按 2×2 patch 切 token。
+    # 输入图片的 height/width要能够被 vae_scale 整除
     if height % vae_scale != 0:
         raise ValueError(f"Height must be divisible by {vae_scale} (got {height}).")
     if width % vae_scale != 0:
@@ -113,7 +113,7 @@ def generate(
             tokenize=False,
             add_generation_prompt=True,
             enable_thinking=True,
-        )
+        ) # 用 Qwen3 的对话格式包装，因为 Qwen3 在这种格式上训练过
         formatted_prompts.append(formatted_prompt)
 
     text_inputs = tokenizer(
@@ -122,20 +122,20 @@ def generate(
         max_length=max_sequence_length,
         truncation=True,
         return_tensors="pt",
-    )
+    ) 
 
-    text_input_ids = text_inputs.input_ids.to(device)
-    prompt_masks = text_inputs.attention_mask.to(device).bool()
+    text_input_ids = text_inputs.input_ids.to(device) # shape: [1, 512]
+    prompt_masks = text_inputs.attention_mask.to(device).bool() # shape: [1, 512]
 
     prompt_embeds = text_encoder(
         input_ids=text_input_ids,
         attention_mask=prompt_masks,
         output_hidden_states=True,
-    ).hidden_states[-2]
+    ).hidden_states[-2] # 取倒数第二层, shape:[1, 512, 2560]
 
     prompt_embeds_list = []
-    for i in range(len(prompt_embeds)):
-        prompt_embeds_list.append(prompt_embeds[i][prompt_masks[i]])
+    for i in range(len(prompt_embeds)): # 当你用一个 shape 为 [512] 的 bool tensor 去索引一个 shape 为 [512, 2560] 的 tensor 时，PyTorch 会把第一维中 mask 为 True 的行取出来，丢掉 False 的行。
+        prompt_embeds_list.append(prompt_embeds[i][prompt_masks[i]]) # 里面的tensor shape：[24, 2560]
 
     negative_prompt_embeds_list = []
     if do_classifier_free_guidance:
@@ -173,7 +173,7 @@ def generate(
         ).hidden_states[-2]
 
         for i in range(len(neg_embeds)):
-            negative_prompt_embeds_list.append(neg_embeds[i][neg_masks[i]])
+            negative_prompt_embeds_list.append(neg_embeds[i][neg_masks[i]]) # 里面的tensor shape：[8, 2560]
 
     if num_images_per_prompt > 1:
         prompt_embeds_list = [pe for pe in prompt_embeds_list for _ in range(num_images_per_prompt)]
@@ -182,14 +182,14 @@ def generate(
                 npe for npe in negative_prompt_embeds_list for _ in range(num_images_per_prompt)
             ]
 
-    height_latent = 2 * (int(height) // vae_scale)
+    height_latent = 2 * (int(height) // vae_scale) # 获得latent的尺寸
     width_latent = 2 * (int(width) // vae_scale)
     shape = (batch_size * num_images_per_prompt, transformer.in_channels, height_latent, width_latent)
 
-    latents = torch.randn(shape, generator=generator, device=device, dtype=torch.float32)
+    latents = torch.randn(shape, generator=generator, device=device, dtype=torch.float32) # shape: [1, 16, 64, 64]
 
     actual_batch_size = batch_size * num_images_per_prompt
-    image_seq_len = (latents.shape[2] // 2) * (latents.shape[3] // 2)
+    image_seq_len = (latents.shape[2] // 2) * (latents.shape[3] // 2) # 因为要在latent上按2x2 patch切token
 
     mu = calculate_shift(
         image_seq_len,
@@ -197,7 +197,7 @@ def generate(
         scheduler.config.get("max_image_seq_len", 4096),
         scheduler.config.get("base_shift", 0.5),
         scheduler.config.get("max_shift", 1.15),
-    )
+    ) # image_seq_len 越大，mu 越接近 max_shift，image_seq_len 越小，mu 越接近 base_shift
     scheduler.sigma_min = 0.0
     scheduler_kwargs = {"mu": mu}
     timesteps, num_inference_steps = retrieve_timesteps(
@@ -225,16 +225,16 @@ def generate(
 
         current_guidance_scale = guidance_scale
         if do_classifier_free_guidance and cfg_truncation is not None and float(cfg_truncation) <= 1:
-            if t_norm > cfg_truncation:
+            if t_norm > cfg_truncation: # 当采样进度超过 cfg_truncation 后，关闭 CFG。
                 current_guidance_scale = 0.0
 
-        apply_cfg = do_classifier_free_guidance and current_guidance_scale > 0
+        apply_cfg = do_classifier_free_guidance and current_guidance_scale > 0 # 是否应用CFG。
 
         if apply_cfg:
             latents_typed = latents.to(
                 transformer.dtype if hasattr(transformer, "dtype") else next(transformer.parameters()).dtype
-            )
-            latent_model_input = latents_typed.repeat(2, 1, 1, 1)
+            ) # 将latents转换为transformer的dtype，此处是bfloat16 shape: [1,16,64,64]
+            latent_model_input = latents_typed.repeat(2, 1, 1, 1) # shape: [1,16,64,64]
             prompt_embeds_model_input = prompt_embeds_list + negative_prompt_embeds_list
             timestep_model_input = timestep.repeat(2)
         else:
@@ -242,14 +242,14 @@ def generate(
             prompt_embeds_model_input = prompt_embeds_list
             timestep_model_input = timestep
 
-        latent_model_input = latent_model_input.unsqueeze(2)
-        latent_model_input_list = list(latent_model_input.unbind(dim=0))
+        latent_model_input = latent_model_input.unsqueeze(2) # shape: [2,16,1,64,64], 添加t维度
+        latent_model_input_list = list(latent_model_input.unbind(dim=0)) # [[16,1,64,64], [16,1,64,64]]
 
         model_out_list = transformer(
             latent_model_input_list,
             timestep_model_input,
             prompt_embeds_model_input,
-        )[0]
+        )[0] # 输入latent列表、timestep列表、Prompt列表，输出也为列表，shape: [[16,1,64,64], [16,1,64,64]]
 
         if apply_cfg:
             pos_out = model_out_list[:actual_batch_size]
@@ -267,12 +267,12 @@ def generate(
                     if new_pos_norm > max_new_norm:
                         pred = pred * (max_new_norm / new_pos_norm)
                 noise_pred.append(pred)
-            noise_pred = torch.stack(noise_pred, dim=0)
+            noise_pred = torch.stack(noise_pred, dim=0) # shape: [1, 16, 1, 64, 64]
         else:
             noise_pred = torch.stack([t.float() for t in model_out_list], dim=0)
 
-        noise_pred = -noise_pred.squeeze(2)
-        latents = scheduler.step(noise_pred.to(torch.float32), t, latents, return_dict=False)[0]
+        noise_pred = -noise_pred.squeeze(2) # [1, 16, 64, 64]
+        latents = scheduler.step(noise_pred.to(torch.float32), t, latents, return_dict=False)[0] # shape: [1, 16, 64, 64]
         assert latents.dtype == torch.float32
 
     if output_type == "latent":
@@ -280,14 +280,14 @@ def generate(
 
     shift_factor = getattr(vae.config, "shift_factor", 0.0) or 0.0
     latents = (latents.to(vae.dtype) / vae.config.scaling_factor) + shift_factor
-    image = vae.decode(latents, return_dict=False)[0]
+    image = vae.decode(latents, return_dict=False)[0] # shape: [1, 3, 512, 512]
 
     if output_type == "pil":
         from PIL import Image
 
         image = (image / 2 + 0.5).clamp(0, 1)
-        image = image.cpu().permute(0, 2, 3, 1).float().numpy()
-        image = (image * 255).round().astype("uint8")
+        image = image.cpu().permute(0, 2, 3, 1).float().numpy() # shape: [1, 512, 512, 3]
+        image = (image * 255).round().astype("uint8") # shape: [1, 512, 512, 3]
         image = [Image.fromarray(img) for img in image]
 
     return image

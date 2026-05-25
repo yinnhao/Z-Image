@@ -15,18 +15,22 @@ def main():
     model_path = ensure_model_weights("ckpts/Z-Image-Turbo", verify=False)  # True to verify with md5
     dtype = torch.bfloat16
     compile = False  # default False for compatibility
-    output_path = "example.png"
+    output_path = "example_turbo_3dico_nf.png"
     height = 1024
     width = 1024
     num_inference_steps = 8
     guidance_scale = 0.0
     seed = 42
     attn_backend = os.environ.get("ZIMAGE_ATTENTION", "_native_flash")
+    # prompt = (
+    #     "Young Chinese woman in red Hanfu, intricate embroidery. Impeccable makeup, red floral forehead pattern. "
+    #     "Elaborate high bun, golden phoenix headdress, red flowers, beads. Holds round folding fan with lady, trees, bird. "
+    #     "Neon lightning-bolt lamp (⚡️), bright yellow glow, above extended left palm. Soft-lit outdoor night background, "
+    #     "silhouetted tiered pagoda (西安大雁塔), blurred colorful distant lights."
+    # )
     prompt = (
-        "Young Chinese woman in red Hanfu, intricate embroidery. Impeccable makeup, red floral forehead pattern. "
-        "Elaborate high bun, golden phoenix headdress, red flowers, beads. Holds round folding fan with lady, trees, bird. "
-        "Neon lightning-bolt lamp (⚡️), bright yellow glow, above extended left palm. Soft-lit outdoor night background, "
-        "silhouetted tiered pagoda (西安大雁塔), blurred colorful distant lights."
+        "a 3dicon, netflix logo with popcorn and a cup"
+        # "a 3dicon, a cute cat on purple background"
     )
 
     # Device selection priority: cuda -> tpu -> mps -> cpu

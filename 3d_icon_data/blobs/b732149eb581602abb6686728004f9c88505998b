@@ -1,0 +1,13 @@
+---
+# For reference on dataset card metadata, see the spec: https://github.com/huggingface/hub-docs/blob/main/datasetcard.md?plain=1
+# Doc / guide: https://huggingface.co/docs/hub/datasets-cards
+{}
+---
+
+# 3D icons Dataset
+
+
+This dataset contains free-licensed images, downloaded from [unsplash](https://unsplash.com/). Curated and created by:
+- [Maria Shalabaieva](https://unsplash.com/@maria_shalabaieva)
+- [Alexander Shatov](https://unsplash.com/@alexbemore)
+

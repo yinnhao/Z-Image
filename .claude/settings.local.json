@@ -1,0 +1,34 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 *)",
+      "Bash(conda run *)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git config *)",
+      "Bash(git push *)",
+      "Bash(export https_proxy=http://agent.baidu.com:8891)",
+      "Bash(pip install *)",
+      "Read(//root/.cache/huggingface/datasets/**)",
+      "Read(//root/.cache/huggingface/**)",
+      "Bash(xargs ls *)",
+      "Bash(nvidia-smi)",
+      "Bash(nvidia-smi *)",
+      "Bash(CUDA_VISIBLE_DEVICES=0 conda run *)",
+      "Bash(source activate:*)",
+      "Bash(git commit:*)",
+      "Bash(eval:*)",
+      "Bash(chmod:*)",
+      "Bash(git status:*)",
+      "Bash(python:*)",
+      "Bash(ls:*)",
+      "Bash(CUDA_VISIBLE_DEVICES=0 python /tmp/gen_original.py)",
+      "Bash(cat:*)",
+      "Bash(CUDA_VISIBLE_DEVICES=0 python /tmp/gen_ablate_cfg2.py)",
+      "Bash(for d:*)",
+      "Bash(do echo:*)",
+      "Read(//root/zyh/Z-Image/output/ablation/**)",
+      "Bash(done)"
+    ]
+  }
+}
