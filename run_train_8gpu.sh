@@ -13,6 +13,7 @@ BATCH_SIZE=${BATCH_SIZE:-1}
 LR=${LR:-1e-4}
 RANK=${RANK:-64}
 GRAD_ACCUM=${GRAD_ACCUM:-2}
+VAL_EVERY=${VAL_EVERY:-200}
 
 echo "=== 8-GPU DDP Edit LoRA Training ==="
 echo "Epochs: $EPOCHS"
@@ -20,6 +21,7 @@ echo "Per-GPU batch size: $BATCH_SIZE"
 echo "Effective batch size: $((BATCH_SIZE * 8 * GRAD_ACCUM))"
 echo "Learning rate: $LR"
 echo "LoRA rank: $RANK"
+echo "Validate every: $VAL_EVERY steps"
 echo ""
 
 torchrun --nproc_per_node=8 --master_port=29500 \
@@ -29,4 +31,5 @@ torchrun --nproc_per_node=8 --master_port=29500 \
     --batch_size $BATCH_SIZE \
     --lr $LR \
     --rank $RANK \
-    --grad_accum $GRAD_ACCUM
+    --grad_accum $GRAD_ACCUM \
+    --val_every $VAL_EVERY

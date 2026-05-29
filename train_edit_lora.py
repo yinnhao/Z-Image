@@ -80,6 +80,7 @@ class EditTrainConfig:
     save_every_steps = 500
     log_every_steps = 10
     validate_every_steps = 200
+    val_samples_per_run = None                      # 每次验证推理多少样本（None=全部验证集）
     seed = 42
 
     # --- LoRA 配置 ---
@@ -607,6 +608,149 @@ def edit_collate_fn(batch):
 
 
 # ============================================================================
+# 验证：完整去噪推理
+# ============================================================================
+
+
+def validate_full(
+    transformer,
+    semantic_processor,
+    val_dataset,
+    vae,
+    scheduler,
+    config,
+    global_step,
+    output_dir,
+    device,
+    num_val_steps=20,
+    max_val_samples=None,
+):
+    """
+    在验证集上运行完整去噪推理，保存 source / generated / target 对比图。
+
+    Args:
+        val_dataset: EditPrecomputedDataset（验证子集）
+        vae: VAE 模型（懒加载）
+        scheduler: FlowMatchEulerDiscreteScheduler
+        num_val_steps: 验证推理步数（默认 20，快速预览）
+        max_val_samples: 每次最多推理多少张（None=全部）
+    """
+    import inspect
+    from config import BASE_IMAGE_SEQ_LEN, BASE_SHIFT, MAX_IMAGE_SEQ_LEN, MAX_SHIFT
+
+    transformer.eval()
+    semantic_processor.eval()
+
+    val_dir = Path(output_dir) / "val_samples" / f"step_{global_step:06d}"
+    val_dir.mkdir(parents=True, exist_ok=True)
+
+    n_samples = len(val_dataset) if max_val_samples is None else min(max_val_samples, len(val_dataset))
+
+    # 设置 scheduler 的 mu 参数
+    height_latent = config.resolution // 8
+    width_latent = config.resolution // 8
+    image_seq_len = (height_latent // 2) * (width_latent // 2)
+    m = (MAX_SHIFT - BASE_SHIFT) / (MAX_IMAGE_SEQ_LEN - BASE_IMAGE_SEQ_LEN)
+    b = BASE_SHIFT - m * BASE_IMAGE_SEQ_LEN
+    mu = image_seq_len * m + b
+
+    scheduler.sigma_min = 0.0
+    scheduler.set_timesteps(num_val_steps, device=device, mu=mu)
+    timesteps = scheduler.timesteps
+
+    total_mse = 0.0
+    logger.info(f"[Validate] Running full inference on {n_samples} samples ({num_val_steps} steps)...")
+
+    with torch.no_grad():
+        for idx in tqdm(range(n_samples), desc=f"Val step {global_step}"):
+            sample = val_dataset[idx]
+            source_latent = sample["source_latent"].to(device, dtype=torch.bfloat16)   # [16, H, W]
+            target_latent = sample["target_latent"].to(device, dtype=torch.bfloat16)   # [16, H, W]
+            semantic_feat = sample["semantic_feature"].to(device, dtype=torch.bfloat16)  # [N, dim]
+            text_emb = sample["text_embedding"].to(device, dtype=torch.bfloat16)        # [seq, 2560]
+            prompt_text = sample["prompt"]
+
+            # Semantic Processor
+            sem_embed = semantic_processor(semantic_feat.unsqueeze(0)).squeeze(0)  # [N, 2560]
+            cap_feats = torch.cat([text_emb, sem_embed], dim=0)  # [seq+N, 2560]
+
+            # 去噪
+            source_5d = source_latent.unsqueeze(1)  # [16, 1, H, W]
+            latents = torch.randn(1, 16, 1, height_latent, width_latent, device=device, dtype=torch.float32)
+
+            for i, t in enumerate(timesteps):
+                if t == 0 and i == len(timesteps) - 1:
+                    continue
+
+                combined = torch.cat([latents, source_5d.unsqueeze(0).to(latents.dtype)], dim=2)  # [1,16,2,H,W]
+                timestep_model = (1000 - t.expand(1)) / 1000
+
+                x_list = [combined[0].to(torch.bfloat16)]  # [16, 2, H, W]
+                model_out_list = transformer(x_list, timestep_model, [cap_feats])[0]
+
+                noise_pred = model_out_list[0][:, :1, :, :]  # [16, 1, H, W] -> frame 0
+                noise_pred = -noise_pred.float().unsqueeze(0).squeeze(2)  # [1, 16, H, W]
+                latents_2d = latents.squeeze(2)
+                latents_2d = scheduler.step(noise_pred.float(), t, latents_2d, return_dict=False)[0]
+                latents = latents_2d.unsqueeze(2)
+
+            # VAE decode generated
+            shift_factor = getattr(vae.config, "shift_factor", 0.0) or 0.0
+            decode_latents = (latents.squeeze(2).to(vae.dtype) / vae.config.scaling_factor) + shift_factor
+            decoded_gen = vae.decode(decode_latents, return_dict=False)[0]
+            decoded_gen = (decoded_gen / 2 + 0.5).clamp(0, 1)
+
+            # VAE decode target (ground truth)
+            target_for_decode = (target_latent.unsqueeze(0).to(vae.dtype) / vae.config.scaling_factor) + shift_factor
+            decoded_tgt = vae.decode(target_for_decode, return_dict=False)[0]
+            decoded_tgt = (decoded_tgt / 2 + 0.5).clamp(0, 1)
+
+            # VAE decode source
+            source_for_decode = (source_latent.unsqueeze(0).to(vae.dtype) / vae.config.scaling_factor) + shift_factor
+            decoded_src = vae.decode(source_for_decode, return_dict=False)[0]
+            decoded_src = (decoded_src / 2 + 0.5).clamp(0, 1)
+
+            # 计算 latent 空间 MSE
+            gen_latent = (latents.squeeze(2).to(torch.float32) - config.vae_shift_factor) * config.vae_scaling_factor
+            # Actually just compare generated latent with target latent directly
+            total_mse += F.mse_loss(latents.squeeze(2).squeeze(0).float(),
+                                     target_latent.float()).item()
+
+            # 保存对比图: source | generated | target
+            def to_pil(tensor):
+                img = tensor[0].cpu().permute(1, 2, 0).float().numpy()
+                img = (img * 255).round().clip(0, 255).astype("uint8")
+                return Image.fromarray(img)
+
+            src_img = to_pil(decoded_src)
+            gen_img = to_pil(decoded_gen)
+            tgt_img = to_pil(decoded_tgt)
+
+            # 拼接三张图
+            w, h = src_img.size
+            comparison = Image.new("RGB", (w * 3, h))
+            comparison.paste(src_img, (0, 0))
+            comparison.paste(gen_img, (w, 0))
+            comparison.paste(tgt_img, (w * 2, 0))
+            comparison.save(val_dir / f"{idx:03d}.jpg", quality=90)
+
+            # 保存 prompt 文本
+            if idx == 0:
+                prompt_file = open(val_dir / "prompts.txt", "w")
+            else:
+                prompt_file = open(val_dir / "prompts.txt", "a")
+            prompt_file.write(f"{idx:03d}: {prompt_text}\n")
+            prompt_file.close()
+
+    avg_mse = total_mse / n_samples
+    logger.info(f"[Validate] Done. Avg latent MSE: {avg_mse:.6f}. Images saved to {val_dir}")
+
+    transformer.train()
+    semantic_processor.train()
+    return avg_mse
+
+
+# ============================================================================
 # 训练阶段
 # ============================================================================
 
@@ -732,12 +876,25 @@ def train(config: EditTrainConfig):
     if is_main:
         logger.info(f"  Semantic Processor params: {sum(p.numel() for p in semantic_processor.parameters()):,}")
 
-    # ========== 4. 加载数据集 ==========
-    dataset = EditPrecomputedDataset(config.cache_dir)
+    # ========== 4. 加载数据集（拆分 train/val） ==========
+    full_dataset = EditPrecomputedDataset(config.cache_dir)
+
+    # 随机抽取 100 个样本作为验证集（固定种子保证可复现）
+    n_val = min(100, len(full_dataset) // 10)
+    rng = torch.Generator().manual_seed(42)
+    all_indices = torch.randperm(len(full_dataset), generator=rng).tolist()
+    val_indices = all_indices[:n_val]
+    train_indices = all_indices[n_val:]
+
+    train_dataset = torch.utils.data.Subset(full_dataset, train_indices)
+    val_dataset = torch.utils.data.Subset(full_dataset, val_indices)
+    if is_main:
+        logger.info(f"Dataset split: {len(train_dataset)} train, {len(val_dataset)} val")
+
     if distributed:
-        sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True, seed=config.seed)
+        sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True, seed=config.seed)
         dataloader = DataLoader(
-            dataset,
+            train_dataset,
             batch_size=config.batch_size,
             sampler=sampler,
             collate_fn=edit_collate_fn,
@@ -748,7 +905,7 @@ def train(config: EditTrainConfig):
     else:
         sampler = None
         dataloader = DataLoader(
-            dataset,
+            train_dataset,
             batch_size=config.batch_size,
             shuffle=True,
             collate_fn=edit_collate_fn,
@@ -757,8 +914,7 @@ def train(config: EditTrainConfig):
         )
 
     # ========== 5. 验证组件（延迟加载，节省显存） ==========
-    # 训练时不加载额外的 transformer 副本，仅在验证时使用训练中的 transformer
-    # VAE 等组件在需要时加载
+    # VAE 和 scheduler 在首次验证时加载到 rank 0 设备
     val_vae = None
     val_scheduler = None
 
@@ -771,7 +927,7 @@ def train(config: EditTrainConfig):
     optimizer = bnb.optim.AdamW8bit(all_trainable_params, lr=config.learning_rate, weight_decay=0.01)
 
     # DDP: 每个 epoch 每张卡看 len(dataset)/world_size 个样本
-    steps_per_epoch = math.ceil(len(dataset) / (config.batch_size * world_size))
+    steps_per_epoch = math.ceil(len(train_dataset) / (config.batch_size * world_size))
     total_steps = config.epochs * steps_per_epoch
     effective_steps = total_steps // config.gradient_accumulation_steps
 
@@ -876,11 +1032,22 @@ def train(config: EditTrainConfig):
 
             # --- 梯度累积 & 参数更新 ---
             if (step + 1) % config.gradient_accumulation_steps == 0:
-                # DDP: 手动 all-reduce 梯度（因为 transformer 使用 list-based forward，不能直接用 DDP wrapper）
+                # DDP: 同步所有 rank 的梯度（flatten 后一次 all-reduce，高效）
                 if distributed:
+                    # 收集所有有梯度的参数到 flat buffer
+                    grads = []
                     for param in all_trainable_params:
-                        if param.grad is not None:
-                            dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
+                        if param.grad is None:
+                            param.grad = torch.zeros_like(param)
+                        grads.append(param.grad.flatten())
+                    flat_grads = torch.cat(grads)
+                    dist.all_reduce(flat_grads, op=dist.ReduceOp.AVG)
+                    # 写回
+                    offset = 0
+                    for param in all_trainable_params:
+                        numel = param.grad.numel()
+                        param.grad.copy_(flat_grads[offset:offset + numel].view_as(param.grad))
+                        offset += numel
 
                 torch.nn.utils.clip_grad_norm_(all_trainable_params, 1.0)
                 optimizer.step()
@@ -897,35 +1064,34 @@ def train(config: EditTrainConfig):
                     writer.add_scalar("train/lr", lr, global_step)
                     running_loss = 0.0
 
-                # --- 验证（仅 rank 0） ---
+                # --- 验证（仅 rank 0）：完整推理 100 个验证样本 ---
                 if is_main and global_step % config.validate_every_steps == 0:
-                    logger.info(f"[Validate] Generating sample at step {global_step}...")
-                    transformer.eval()
-                    semantic_processor.eval()
+                    # 懒加载 VAE 和 scheduler（首次验证时）
+                    if val_vae is None:
+                        from diffusers import AutoencoderKL
+                        from zimage.scheduler import FlowMatchEulerDiscreteScheduler
+                        logger.info("[Validate] Loading VAE and scheduler for validation...")
+                        model_dir = Path(config.model_path)
+                        val_vae = AutoencoderKL.from_pretrained(
+                            str(model_dir / "vae"), torch_dtype=torch.bfloat16
+                        ).to(device)
+                        val_vae.eval()
+                        val_scheduler = FlowMatchEulerDiscreteScheduler()
 
-                    with torch.no_grad():
-                        val_source = dataset.source_latents[0].to(device, dtype=torch.bfloat16)
-                        val_target = dataset.target_latents[0].to(device, dtype=torch.bfloat16)
-                        val_semantic = dataset.semantic_features[0].to(device, dtype=torch.bfloat16)
-                        val_text = dataset.text_embeddings[0].to(device, dtype=torch.bfloat16)
-
-                        val_sem_embed = semantic_processor(val_semantic.unsqueeze(0)).squeeze(0)
-                        val_cap = torch.cat([val_text, val_sem_embed], dim=0)
-
-                        val_noise = torch.randn_like(val_target)
-                        val_x = torch.cat([val_noise.unsqueeze(1), val_source.unsqueeze(1)], dim=1)
-                        val_timestep = torch.tensor([0.0], device=device, dtype=torch.bfloat16)
-
-                        val_pred, _ = transformer([val_x], val_timestep, [val_cap])
-                        val_pred_frame0 = val_pred[0][:, 0, :, :]
-
-                        val_gt = val_target - val_noise
-                        val_mse = F.mse_loss(val_pred_frame0.float(), val_gt.float()).item()
-                        writer.add_scalar("validation/mse", val_mse, global_step)
-                        logger.info(f"[Validate] MSE on sample 0: {val_mse:.6f}")
-
-                    transformer.train()
-                    semantic_processor.train()
+                    val_mse = validate_full(
+                        transformer=transformer,
+                        semantic_processor=semantic_processor,
+                        val_dataset=val_dataset,
+                        vae=val_vae,
+                        scheduler=val_scheduler,
+                        config=config,
+                        global_step=global_step,
+                        output_dir=output_dir,
+                        device=device,
+                        num_val_steps=20,
+                        max_val_samples=config.val_samples_per_run,
+                    )
+                    writer.add_scalar("validation/latent_mse", val_mse, global_step)
 
                 # --- 保存 checkpoint（仅 rank 0） ---
                 if is_main and global_step % config.save_every_steps == 0:
@@ -934,9 +1100,6 @@ def train(config: EditTrainConfig):
                     transformer.save_pretrained(save_path / "lora")
                     torch.save(semantic_processor.state_dict(), save_path / "semantic_processor.pt")
                     logger.info(f"Saved checkpoint to {save_path}")
-
-                if distributed:
-                    dist.barrier()
 
     # ========== 8. 保存最终权重 ==========
     if is_main:
@@ -1165,6 +1328,8 @@ def main():
     parser.add_argument("--rank", type=int, default=None, help="覆盖 LoRA rank")
     parser.add_argument("--batch_size", type=int, default=None, help="覆盖 batch size")
     parser.add_argument("--grad_accum", type=int, default=None, help="覆盖梯度累积步数")
+    parser.add_argument("--val_every", type=int, default=None, help="覆盖验证间隔步数")
+    parser.add_argument("--val_samples", type=int, default=None, help="每次验证的样本数（默认全部100）")
     parser.add_argument("--resolution", type=int, default=None, help="覆盖分辨率")
     parser.add_argument("--steps", type=int, default=None, help="覆盖推理步数")
     parser.add_argument("--cfg", type=float, default=None, help="覆盖 guidance scale")
@@ -1192,6 +1357,10 @@ def main():
         config.batch_size = args.batch_size
     if args.grad_accum:
         config.gradient_accumulation_steps = args.grad_accum
+    if args.val_every:
+        config.validate_every_steps = args.val_every
+    if args.val_samples:
+        config.val_samples_per_run = args.val_samples
     if args.resolution:
         config.resolution = args.resolution
     if args.steps:
