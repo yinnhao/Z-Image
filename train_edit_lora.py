@@ -31,10 +31,13 @@ import sys
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset
+from torch.utils.data.distributed import DistributedSampler
 from torchvision import transforms
 from tqdm import tqdm
 
@@ -202,7 +205,7 @@ def extract_siglip_features(siglip_model, siglip_processor, images, device):
 # ============================================================================
 
 
-def load_tsv_dataset(data_dir, prompt_level="short", max_samples=None):
+def load_tsv_dataset(data_dir, prompt_level="short", max_samples=None, shard_id=None, num_shards=None, start_idx=0):
     """
     加载 TSV 格式的编辑数据集。
 
@@ -220,8 +223,12 @@ def load_tsv_dataset(data_dir, prompt_level="short", max_samples=None):
         data_dir: 数据集根目录（含 part-XX 文件）
         prompt_level: 使用哪个级别的 prompt ("short"=field5, "medium"=field6, "long"=field7)
         max_samples: 最大样本数（None=全部加载）
+        shard_id: 当前分片 ID（None=不分片）
+        num_shards: 总分片数
+        start_idx: 全局起始索引（用于跨子目录连续编号）
     Returns:
-        生成器，每次 yield (source_img: PIL.Image, target_img: PIL.Image, prompt: str)
+        生成器，每次 yield (source_img: PIL.Image, target_img: PIL.Image, prompt: str, next_idx: int)
+        最后一个 yield 后可通过 .gi_frame 无法获取 next_idx，所以改为返回 tuple
     """
     import base64
     from io import BytesIO
@@ -230,12 +237,12 @@ def load_tsv_dataset(data_dir, prompt_level="short", max_samples=None):
     prompt_idx = prompt_field_map.get(prompt_level, 5)
 
     data_dir = Path(data_dir)
-    # 找到所有 part-XX 文件
     part_files = sorted(data_dir.glob("part-*"))
     if not part_files:
         raise FileNotFoundError(f"No part-* files found in {data_dir}")
 
     count = 0
+    global_idx = start_idx
     for part_file in part_files:
         with open(part_file) as f:
             for line in f:
@@ -244,6 +251,13 @@ def load_tsv_dataset(data_dir, prompt_level="short", max_samples=None):
                 line = line.strip()
                 if not line:
                     continue
+
+                # 分片过滤：在 base64 解码之前跳过不属于本 shard 的样本
+                if shard_id is not None and global_idx % num_shards != shard_id:
+                    global_idx += 1
+                    continue
+                global_idx += 1
+
                 parts = line.split("\t")
                 if len(parts) < 8:
                     continue
@@ -295,7 +309,7 @@ def detect_dataset_format(data_dir):
                      f"Expected metadata.jsonl or part-* files.")
 
 
-def precompute(config: EditTrainConfig):
+def precompute(config: EditTrainConfig, shard_id=None, num_shards=None):
     """
     预计算 VAE latents、text embeddings 和 SigLip-2 特征，保存到磁盘。
 
@@ -373,52 +387,154 @@ def precompute(config: EditTrainConfig):
         transforms.Normalize([0.5], [0.5]),  # [0,1] -> [-1,1]
     ])
 
-    # 构建样本迭代器
+    # 构建样本迭代器（分片过滤已在 load_tsv_dataset 内部完成，按行号跳过不解码）
     def get_samples():
         if fmt == "jsonl":
-            yield from samples_iter
+            for idx, item in enumerate(samples_iter):
+                if shard_id is not None and idx % num_shards != shard_id:
+                    continue
+                yield item
         elif fmt == "tsv":
-            yield from load_tsv_dataset(data_dir, config.prompt_level, config.max_samples)
+            yield from load_tsv_dataset(data_dir, config.prompt_level, config.max_samples,
+                                        shard_id=shard_id, num_shards=num_shards)
         elif fmt == "tsv_multi":
             count = 0
+            cumulative_idx = 0
             subdirs = sorted(d for d in data_dir.iterdir() if d.is_dir() and list(d.glob("part-*")))
             for sd in subdirs:
                 logger.info(f"  Processing subdir: {sd.name}")
-                for item in load_tsv_dataset(sd, config.prompt_level):
+                # 获取该子目录的样本数以计算 cumulative offset
+                count_file = sd / "count.txt"
+                subdir_total = 0
+                if count_file.exists():
+                    with open(count_file) as f:
+                        for line in f:
+                            p = line.strip().split(",")
+                            if len(p) == 2:
+                                subdir_total += int(p[1])
+
+                for item in load_tsv_dataset(sd, config.prompt_level,
+                                             shard_id=shard_id, num_shards=num_shards,
+                                             start_idx=cumulative_idx):
                     if config.max_samples and count >= config.max_samples:
                         return
                     yield item
                     count += 1
+                cumulative_idx += subdir_total
 
-    logger.info(f"Precomputing samples (resolution={config.resolution})...")
+    shard_info = f" (shard {shard_id}/{num_shards})" if shard_id is not None else ""
+    shard_count = (total_count + num_shards - 1) // num_shards if num_shards else total_count
+    logger.info(f"Precomputing samples{shard_info} (resolution={config.resolution})...")
     all_source_latents = []
     all_target_latents = []
     all_semantic_features = []
     all_text_embeddings = []
     all_prompts = []
 
-    for source_img, target_img, prompt in tqdm(get_samples(), desc="Encoding", total=total_count):
+    # Batch 化处理提高 GPU 利用率
+    BATCH_SIZE = 8  # 每次攒够 8 个样本统一送 GPU
+    batch_sources = []
+    batch_targets = []
+    batch_source_imgs = []
+    batch_prompts_buf = []
+
+    def flush_batch():
+        """将攒好的 batch 统一送 GPU 处理。"""
+        if not batch_sources:
+            return
+        B = len(batch_sources)
+
+        # VAE batch encode 源图
+        src_batch = torch.stack(batch_sources).to(device, dtype=torch.float32)
+        src_latents = vae_encode(vae, src_batch, config.vae_scaling_factor, config.vae_shift_factor)
+        for i in range(B):
+            all_source_latents.append(src_latents[i].cpu())
+
+        # VAE batch encode 目标图
+        tgt_batch = torch.stack(batch_targets).to(device, dtype=torch.float32)
+        tgt_latents = vae_encode(vae, tgt_batch, config.vae_scaling_factor, config.vae_shift_factor)
+        for i in range(B):
+            all_target_latents.append(tgt_latents[i].cpu())
+
+        # SigLip-2 batch 特征提取
+        sem_feats = extract_siglip_features(siglip_model, siglip_processor, batch_source_imgs, device)
+        for i in range(B):
+            all_semantic_features.append(sem_feats[i])
+
+        # 文本 batch 编码
+        embs = encode_text(tokenizer, text_encoder, batch_prompts_buf, config.max_sequence_length, device)
+        all_text_embeddings.extend(embs)
+
+        batch_sources.clear()
+        batch_targets.clear()
+        batch_source_imgs.clear()
+        batch_prompts_buf.clear()
+
+    processed = 0
+    for source_img, target_img, prompt in tqdm(get_samples(), desc=f"Encoding{shard_info}", total=shard_count):
         all_prompts.append(prompt)
 
-        # VAE 编码源图
-        source_tensor = transform(source_img).unsqueeze(0).to(device, dtype=torch.float32)
-        source_latent = vae_encode(vae, source_tensor, config.vae_scaling_factor, config.vae_shift_factor)
-        all_source_latents.append(source_latent.squeeze(0).cpu())
+        # CPU 预处理（transform + 攒 batch）
+        batch_sources.append(transform(source_img))
+        batch_targets.append(transform(target_img))
+        batch_source_imgs.append(source_img)
+        batch_prompts_buf.append(prompt)
 
-        # VAE 编码目标图
-        target_tensor = transform(target_img).unsqueeze(0).to(device, dtype=torch.float32)
-        target_latent = vae_encode(vae, target_tensor, config.vae_scaling_factor, config.vae_shift_factor)
-        all_target_latents.append(target_latent.squeeze(0).cpu())
+        if len(batch_sources) >= BATCH_SIZE:
+            flush_batch()
 
-        # SigLip-2 特征（使用源图）
-        semantic_feat = extract_siglip_features(siglip_model, siglip_processor, [source_img], device)
-        all_semantic_features.append(semantic_feat.squeeze(0))  # [N_tokens, siglip_dim]
+        processed += 1
 
-        # 文本编码
-        emb = encode_text(tokenizer, text_encoder, [prompt], config.max_sequence_length, device)
-        all_text_embeddings.append(emb[0])
+    # 处理剩余不足一个 batch 的样本
+    flush_batch()
 
-    # 保存到磁盘
+    logger.info(f"Processed {processed} samples{shard_info}")
+
+    # 保存到磁盘（分片模式保存带 shard 后缀的文件）
+    suffix = f"_shard{shard_id}" if shard_id is not None else ""
+    torch.save(all_source_latents, cache_dir / f"source_latents{suffix}.pt")
+    torch.save(all_target_latents, cache_dir / f"target_latents{suffix}.pt")
+    torch.save(all_semantic_features, cache_dir / f"semantic_features{suffix}.pt")
+    torch.save(all_text_embeddings, cache_dir / f"text_embeddings{suffix}.pt")
+    with open(cache_dir / f"prompts{suffix}.json", "w") as f:
+        json.dump(all_prompts, f, ensure_ascii=False)
+
+    logger.info(f"Saved to {cache_dir}/ (suffix='{suffix}')")
+    logger.info(f"  source_latents{suffix}.pt: {len(all_source_latents)} items, shape={all_source_latents[0].shape}")
+    logger.info(f"  target_latents{suffix}.pt: {len(all_target_latents)} items, shape={all_target_latents[0].shape}")
+    logger.info(f"  semantic_features{suffix}.pt: {len(all_semantic_features)} items, shape={all_semantic_features[0].shape}")
+    logger.info(f"  text_embeddings{suffix}.pt: {len(all_text_embeddings)} items, shape[0]={all_text_embeddings[0].shape}")
+
+    del vae, text_encoder, tokenizer, siglip_model, siglip_processor, components
+    torch.cuda.empty_cache()
+
+
+def merge_shards(config: EditTrainConfig, num_shards: int):
+    """合并多个 shard 的预计算结果为统一文件。"""
+    cache_dir = Path(config.cache_dir)
+    logger.info(f"Merging {num_shards} shards from {cache_dir}...")
+
+    all_source_latents = []
+    all_target_latents = []
+    all_semantic_features = []
+    all_text_embeddings = []
+    all_prompts = []
+
+    for i in range(num_shards):
+        suffix = f"_shard{i}"
+        sl = torch.load(cache_dir / f"source_latents{suffix}.pt", weights_only=True)
+        tl = torch.load(cache_dir / f"target_latents{suffix}.pt", weights_only=True)
+        sf = torch.load(cache_dir / f"semantic_features{suffix}.pt", weights_only=True)
+        te = torch.load(cache_dir / f"text_embeddings{suffix}.pt", weights_only=True)
+        with open(cache_dir / f"prompts{suffix}.json") as f:
+            p = json.load(f)
+        all_source_latents.extend(sl)
+        all_target_latents.extend(tl)
+        all_semantic_features.extend(sf)
+        all_text_embeddings.extend(te)
+        all_prompts.extend(p)
+        logger.info(f"  Shard {i}: {len(sl)} samples")
+
     torch.save(all_source_latents, cache_dir / "source_latents.pt")
     torch.save(all_target_latents, cache_dir / "target_latents.pt")
     torch.save(all_semantic_features, cache_dir / "semantic_features.pt")
@@ -426,14 +542,15 @@ def precompute(config: EditTrainConfig):
     with open(cache_dir / "prompts.json", "w") as f:
         json.dump(all_prompts, f, ensure_ascii=False)
 
-    logger.info(f"Saved to {cache_dir}/")
-    logger.info(f"  source_latents.pt: {len(all_source_latents)} items, shape={all_source_latents[0].shape}")
-    logger.info(f"  target_latents.pt: {len(all_target_latents)} items, shape={all_target_latents[0].shape}")
-    logger.info(f"  semantic_features.pt: {len(all_semantic_features)} items, shape={all_semantic_features[0].shape}")
-    logger.info(f"  text_embeddings.pt: {len(all_text_embeddings)} items, shape[0]={all_text_embeddings[0].shape}")
+    logger.info(f"Merged {len(all_source_latents)} total samples → {cache_dir}/")
 
-    del vae, text_encoder, tokenizer, siglip_model, siglip_processor, components
-    torch.cuda.empty_cache()
+    # 清理 shard 文件
+    for i in range(num_shards):
+        suffix = f"_shard{i}"
+        for name in ["source_latents", "target_latents", "semantic_features", "text_embeddings"]:
+            (cache_dir / f"{name}{suffix}.pt").unlink(missing_ok=True)
+        (cache_dir / f"prompts{suffix}.json").unlink(missing_ok=True)
+    logger.info("Cleaned up shard files.")
 
 
 # ============================================================================
@@ -518,11 +635,26 @@ def train(config: EditTrainConfig):
     import bitsandbytes as bnb
     import numpy as np
 
-    device = torch.device("cuda")
-    torch.manual_seed(config.seed)
+    # --- DDP 初始化 ---
+    distributed = dist.is_initialized()
+    if distributed:
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        device = torch.device(f"cuda:{local_rank}")
+        torch.cuda.set_device(device)
+    else:
+        local_rank = 0
+        rank = 0
+        world_size = 1
+        device = torch.device("cuda")
+
+    is_main = (rank == 0)
+    torch.manual_seed(config.seed + rank)  # 不同 rank 用不同种子增加多样性
 
     # ========== 1. 加载 Transformer 模型 ==========
-    logger.info("Loading transformer...")
+    if is_main:
+        logger.info("Loading transformer...")
     model_dir = Path(config.model_path)
     transformer_dir = model_dir / "transformer"
 
@@ -548,14 +680,15 @@ def train(config: EditTrainConfig):
             axes_lens=transformer_config.get("axes_lens", [1536, 512, 512]),
         )
 
-    state_dict = load_sharded_safetensors(transformer_dir)
+    state_dict = load_sharded_safetensors(transformer_dir, device="cpu")
     transformer.load_state_dict(state_dict, strict=False, assign=True)
     del state_dict
     transformer = transformer.to(device=device, dtype=torch.bfloat16)
     transformer.eval()
 
     # ========== 2. 注入 LoRA ==========
-    logger.info("Injecting LoRA adapters...")
+    if is_main:
+        logger.info("Injecting LoRA adapters...")
     lora_config = LoraConfig(
         r=config.lora_rank,
         lora_alpha=config.lora_alpha,
@@ -564,34 +697,64 @@ def train(config: EditTrainConfig):
         bias="none",
     )
     transformer = get_peft_model(transformer, lora_config)
-    transformer.print_trainable_parameters()
+    if is_main:
+        transformer.print_trainable_parameters()
 
     transformer.get_input_embeddings = lambda: None
     for param in transformer.parameters():
         if not param.requires_grad:
             param.requires_grad_(False)
 
+    # 启用 gradient checkpointing 减少显存（在每个 transformer layer 上）
+    from torch.utils.checkpoint import checkpoint as torch_checkpoint
+    base_model = transformer.get_base_model()
+    if hasattr(base_model, 'layers'):
+        for layer in base_model.layers:
+            layer._original_forward = layer.forward
+            def make_ckpt_forward(mod):
+                def ckpt_forward(*args, **kwargs):
+                    return torch_checkpoint(mod._original_forward, *args, use_reentrant=False, **kwargs)
+                return ckpt_forward
+            layer.forward = make_ckpt_forward(layer)
+        if is_main:
+            logger.info(f"Enabled gradient checkpointing on {len(base_model.layers)} layers")
+
     transformer.train()
 
     # ========== 3. 初始化 Semantic Processor ==========
-    logger.info("Initializing Semantic Processor...")
+    if is_main:
+        logger.info("Initializing Semantic Processor...")
     semantic_processor = SemanticProcessor(
         siglip_dim=config.siglip_dim,
         output_dim=2560,
     ).to(device=device, dtype=torch.bfloat16)
     semantic_processor.train()
-    logger.info(f"  Semantic Processor params: {sum(p.numel() for p in semantic_processor.parameters()):,}")
+    if is_main:
+        logger.info(f"  Semantic Processor params: {sum(p.numel() for p in semantic_processor.parameters()):,}")
 
     # ========== 4. 加载数据集 ==========
     dataset = EditPrecomputedDataset(config.cache_dir)
-    dataloader = DataLoader(
-        dataset,
-        batch_size=config.batch_size,
-        shuffle=True,
-        collate_fn=edit_collate_fn,
-        num_workers=0,
-        drop_last=True,
-    )
+    if distributed:
+        sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True, seed=config.seed)
+        dataloader = DataLoader(
+            dataset,
+            batch_size=config.batch_size,
+            sampler=sampler,
+            collate_fn=edit_collate_fn,
+            num_workers=2,
+            pin_memory=True,
+            drop_last=True,
+        )
+    else:
+        sampler = None
+        dataloader = DataLoader(
+            dataset,
+            batch_size=config.batch_size,
+            shuffle=True,
+            collate_fn=edit_collate_fn,
+            num_workers=0,
+            drop_last=True,
+        )
 
     # ========== 5. 验证组件（延迟加载，节省显存） ==========
     # 训练时不加载额外的 transformer 副本，仅在验证时使用训练中的 transformer
@@ -607,7 +770,9 @@ def train(config: EditTrainConfig):
 
     optimizer = bnb.optim.AdamW8bit(all_trainable_params, lr=config.learning_rate, weight_decay=0.01)
 
-    total_steps = config.epochs * math.ceil(len(dataset) / config.batch_size)
+    # DDP: 每个 epoch 每张卡看 len(dataset)/world_size 个样本
+    steps_per_epoch = math.ceil(len(dataset) / (config.batch_size * world_size))
+    total_steps = config.epochs * steps_per_epoch
     effective_steps = total_steps // config.gradient_accumulation_steps
 
     def lr_lambda(step):
@@ -620,21 +785,28 @@ def train(config: EditTrainConfig):
 
     # ========== 7. 训练循环 ==========
     output_dir = Path(config.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    if is_main:
+        output_dir.mkdir(parents=True, exist_ok=True)
 
     global_step = 0
     running_loss = 0.0
 
-    tb_log_dir = output_dir / "tensorboard"
-    writer = SummaryWriter(log_dir=str(tb_log_dir))
-    logger.info(f"TensorBoard logs: {tb_log_dir}")
+    writer = None
+    if is_main:
+        tb_log_dir = output_dir / "tensorboard"
+        writer = SummaryWriter(log_dir=str(tb_log_dir))
+        logger.info(f"TensorBoard logs: {tb_log_dir}")
+        logger.info(f"Starting training: {config.epochs} epochs, {total_steps} total steps")
+        logger.info(f"  World size: {world_size}, Effective batch size: {config.batch_size * config.gradient_accumulation_steps * world_size}")
+        logger.info(f"  LoRA rank: {config.lora_rank}, Semantic Processor: {config.siglip_dim}→2560")
+        logger.info(f"  Learning rate: {config.learning_rate}")
 
-    logger.info(f"Starting training: {config.epochs} epochs, {total_steps} total steps")
-    logger.info(f"  Effective batch size: {config.batch_size * config.gradient_accumulation_steps}")
-    logger.info(f"  LoRA rank: {config.lora_rank}, Semantic Processor: {config.siglip_dim}→2560")
-    logger.info(f"  Learning rate: {config.learning_rate}")
+    if distributed:
+        dist.barrier()
 
     for epoch in range(config.epochs):
+        if sampler is not None:
+            sampler.set_epoch(epoch)
         for step, batch in enumerate(dataloader):
             # --- 准备数据 ---
             target_latents = batch["target_latents"].to(device, dtype=torch.bfloat16)  # [B, 16, H, W]
@@ -704,14 +876,20 @@ def train(config: EditTrainConfig):
 
             # --- 梯度累积 & 参数更新 ---
             if (step + 1) % config.gradient_accumulation_steps == 0:
+                # DDP: 手动 all-reduce 梯度（因为 transformer 使用 list-based forward，不能直接用 DDP wrapper）
+                if distributed:
+                    for param in all_trainable_params:
+                        if param.grad is not None:
+                            dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
+
                 torch.nn.utils.clip_grad_norm_(all_trainable_params, 1.0)
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
                 global_step += 1
 
-                # --- 日志记录 ---
-                if global_step % config.log_every_steps == 0:
+                # --- 日志记录（仅 rank 0） ---
+                if is_main and global_step % config.log_every_steps == 0:
                     avg_loss = running_loss / config.log_every_steps
                     lr = optimizer.param_groups[0]["lr"]
                     logger.info(f"Step {global_step} | Epoch {epoch} | Loss: {avg_loss:.6f} | LR: {lr:.2e}")
@@ -719,32 +897,28 @@ def train(config: EditTrainConfig):
                     writer.add_scalar("train/lr", lr, global_step)
                     running_loss = 0.0
 
-                # --- 验证：使用 img2img 生成 ---
-                if global_step % config.validate_every_steps == 0:
+                # --- 验证（仅 rank 0） ---
+                if is_main and global_step % config.validate_every_steps == 0:
                     logger.info(f"[Validate] Generating sample at step {global_step}...")
                     transformer.eval()
                     semantic_processor.eval()
 
                     with torch.no_grad():
-                        # 简单验证：使用第一个训练样本做 img2img
                         val_source = dataset.source_latents[0].to(device, dtype=torch.bfloat16)
                         val_target = dataset.target_latents[0].to(device, dtype=torch.bfloat16)
                         val_semantic = dataset.semantic_features[0].to(device, dtype=torch.bfloat16)
                         val_text = dataset.text_embeddings[0].to(device, dtype=torch.bfloat16)
 
-                        # Semantic Processor
-                        val_sem_embed = semantic_processor(val_semantic.unsqueeze(0)).squeeze(0)  # [N, 2560]
-                        val_cap = torch.cat([val_text, val_sem_embed], dim=0)  # [seq+N, 2560]
+                        val_sem_embed = semantic_processor(val_semantic.unsqueeze(0)).squeeze(0)
+                        val_cap = torch.cat([val_text, val_sem_embed], dim=0)
 
-                        # 简单的单步前向验证（用纯噪声，观察模型输出是否在收敛）
                         val_noise = torch.randn_like(val_target)
-                        val_x = torch.cat([val_noise.unsqueeze(1), val_source.unsqueeze(1)], dim=1)  # [16, 2, H, W]
-                        val_timestep = torch.tensor([0.0], device=device, dtype=torch.bfloat16)  # pure noise
+                        val_x = torch.cat([val_noise.unsqueeze(1), val_source.unsqueeze(1)], dim=1)
+                        val_timestep = torch.tensor([0.0], device=device, dtype=torch.bfloat16)
 
                         val_pred, _ = transformer([val_x], val_timestep, [val_cap])
-                        val_pred_frame0 = val_pred[0][:, 0, :, :]  # [16, H, W]
+                        val_pred_frame0 = val_pred[0][:, 0, :, :]
 
-                        # 计算与 ground truth target 的差距
                         val_gt = val_target - val_noise
                         val_mse = F.mse_loss(val_pred_frame0.float(), val_gt.float()).item()
                         writer.add_scalar("validation/mse", val_mse, global_step)
@@ -753,24 +927,31 @@ def train(config: EditTrainConfig):
                     transformer.train()
                     semantic_processor.train()
 
-                # --- 保存 checkpoint ---
-                if global_step % config.save_every_steps == 0:
+                # --- 保存 checkpoint（仅 rank 0） ---
+                if is_main and global_step % config.save_every_steps == 0:
                     save_path = output_dir / f"checkpoint-{global_step}"
                     save_path.mkdir(parents=True, exist_ok=True)
-                    # 保存 LoRA 权重
                     transformer.save_pretrained(save_path / "lora")
-                    # 保存 Semantic Processor
                     torch.save(semantic_processor.state_dict(), save_path / "semantic_processor.pt")
                     logger.info(f"Saved checkpoint to {save_path}")
 
+                if distributed:
+                    dist.barrier()
+
     # ========== 8. 保存最终权重 ==========
-    final_path = output_dir / "final"
-    final_path.mkdir(parents=True, exist_ok=True)
-    transformer.save_pretrained(final_path / "lora")
-    torch.save(semantic_processor.state_dict(), final_path / "semantic_processor.pt")
-    writer.close()
-    logger.info(f"Training complete! Weights saved to {final_path}")
-    logger.info(f"TensorBoard logs: tensorboard --logdir {tb_log_dir}")
+    if is_main:
+        final_path = output_dir / "final"
+        final_path.mkdir(parents=True, exist_ok=True)
+        transformer.save_pretrained(final_path / "lora")
+        torch.save(semantic_processor.state_dict(), final_path / "semantic_processor.pt")
+        if writer:
+            writer.close()
+        logger.info(f"Training complete! Weights saved to {final_path}")
+        logger.info(f"TensorBoard logs: tensorboard --logdir {output_dir / 'tensorboard'}")
+
+    if distributed:
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 # ============================================================================
@@ -962,6 +1143,7 @@ def main():
     parser = argparse.ArgumentParser(description="Z-Image-Edit LoRA Training")
     # 运行模式
     parser.add_argument("--precompute", action="store_true", help="预计算 VAE latents、text embeddings 和 SigLip-2 特征")
+    parser.add_argument("--merge_shards", type=int, default=None, help="合并 N 个 shard 的预计算结果")
     parser.add_argument("--train", action="store_true", help="运行 Edit LoRA 训练")
     parser.add_argument("--inference", action="store_true", help="使用训练好的权重进行图像编辑推理")
 
@@ -974,12 +1156,15 @@ def main():
     parser.add_argument("--prompt_level", type=str, default=None, choices=["short", "medium", "long"],
                         help="TSV 数据集 prompt 级别")
     parser.add_argument("--max_samples", type=int, default=None, help="预计算最大样本数")
+    parser.add_argument("--shard", type=str, default=None,
+                        help="预计算分片，格式 'i/N'（如 '0/8' 表示 8 卡中的第 0 卡）")
 
     # 超参数覆盖
     parser.add_argument("--epochs", type=int, default=None, help="覆盖训练轮数")
     parser.add_argument("--lr", type=float, default=None, help="覆盖学习率")
     parser.add_argument("--rank", type=int, default=None, help="覆盖 LoRA rank")
     parser.add_argument("--batch_size", type=int, default=None, help="覆盖 batch size")
+    parser.add_argument("--grad_accum", type=int, default=None, help="覆盖梯度累积步数")
     parser.add_argument("--resolution", type=int, default=None, help="覆盖分辨率")
     parser.add_argument("--steps", type=int, default=None, help="覆盖推理步数")
     parser.add_argument("--cfg", type=float, default=None, help="覆盖 guidance scale")
@@ -1005,6 +1190,8 @@ def main():
         config.lora_alpha = args.rank
     if args.batch_size:
         config.batch_size = args.batch_size
+    if args.grad_accum:
+        config.gradient_accumulation_steps = args.grad_accum
     if args.resolution:
         config.resolution = args.resolution
     if args.steps:
@@ -1014,8 +1201,19 @@ def main():
 
     # 执行对应模式
     if args.precompute:
-        precompute(config)
+        shard_id, num_shards = None, None
+        if args.shard:
+            parts = args.shard.split("/")
+            shard_id, num_shards = int(parts[0]), int(parts[1])
+        precompute(config, shard_id=shard_id, num_shards=num_shards)
+    elif args.merge_shards:
+        merge_shards(config, args.merge_shards)
     elif args.train:
+        # DDP 初始化：如果通过 torchrun 启动，环境变量会自动设置
+        if "RANK" in os.environ:
+            dist.init_process_group(backend="nccl")
+            if int(os.environ.get("RANK", 0)) == 0:
+                logger.info(f"DDP initialized: world_size={dist.get_world_size()}")
         train(config)
     elif args.inference:
         if args.source is None:
