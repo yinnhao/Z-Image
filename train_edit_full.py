@@ -232,6 +232,134 @@ def validate_full(
 
 
 # ============================================================================
+# FSDP-compatible 验证（所有 rank 参与 forward）
+# ============================================================================
+
+_val_vae = None
+_val_scheduler = None
+
+
+def validate_fsdp(
+    transformer, semantic_processor, val_dataset, config,
+    global_step, output_dir, device, rank, world_size, model_dir,
+    num_val_steps=10, max_val_samples=None,
+):
+    """
+    FSDP 兼容验证：所有 rank 参与 transformer forward（all-gather 需要），
+    但只有 rank 0 执行 VAE decode 和图片保存。
+    """
+    global _val_vae, _val_scheduler
+    from config import BASE_IMAGE_SEQ_LEN, BASE_SHIFT, MAX_IMAGE_SEQ_LEN, MAX_SHIFT
+
+    transformer.eval()
+    semantic_processor.eval()
+
+    n_samples = max_val_samples or len(val_dataset)
+    n_samples = min(n_samples, len(val_dataset))
+
+    height_latent = config.resolution // 8
+    width_latent = config.resolution // 8
+    image_seq_len = (height_latent // 2) * (width_latent // 2)
+    m = (MAX_SHIFT - BASE_SHIFT) / (MAX_IMAGE_SEQ_LEN - BASE_IMAGE_SEQ_LEN)
+    b = BASE_SHIFT - m * BASE_IMAGE_SEQ_LEN
+    mu = image_seq_len * m + b
+
+    if rank == 0:
+        logger.info(f"[Validate] Running inference on {n_samples} samples ({num_val_steps} steps)...")
+        val_dir = Path(output_dir) / "val_samples" / f"step_{global_step:06d}"
+        val_dir.mkdir(parents=True, exist_ok=True)
+        # Lazy-load VAE on rank 0
+        if _val_vae is None:
+            from diffusers import AutoencoderKL
+            from zimage.scheduler import FlowMatchEulerDiscreteScheduler
+            logger.info("[Validate] Loading VAE...")
+            _val_vae = AutoencoderKL.from_pretrained(
+                str(model_dir / "vae"), torch_dtype=torch.bfloat16
+            ).to(device)
+            _val_vae.eval()
+            _val_scheduler = FlowMatchEulerDiscreteScheduler()
+
+    # All ranks need a scheduler for timestep iteration
+    from zimage.scheduler import FlowMatchEulerDiscreteScheduler
+    local_scheduler = FlowMatchEulerDiscreteScheduler()
+    local_scheduler.sigma_min = 0.0
+    local_scheduler.set_timesteps(num_val_steps, device=device, mu=mu)
+    timesteps = local_scheduler.timesteps
+
+    total_mse = 0.0
+    with torch.no_grad():
+        for idx in range(n_samples):
+            sample = val_dataset[idx]
+            source_latent = sample["source_latent"].to(device, dtype=torch.bfloat16)
+            target_latent = sample["target_latent"].to(device, dtype=torch.bfloat16)
+            semantic_feat = sample["semantic_feature"].to(device, dtype=torch.bfloat16)
+            text_emb = sample["text_embedding"].to(device, dtype=torch.bfloat16)
+
+            # Semantic processing (DDP module)
+            sp_module = semantic_processor.module if hasattr(semantic_processor, 'module') else semantic_processor
+            sem_embed = sp_module(semantic_feat.unsqueeze(0)).squeeze(0)
+            cap_feats = torch.cat([text_emb, sem_embed], dim=0)
+
+            local_scheduler._step_index = None
+            source_5d = source_latent.unsqueeze(1)
+            latents = torch.randn(1, 16, 1, height_latent, width_latent, device=device, dtype=torch.float32)
+            # Use same seed across ranks for consistent forward
+            torch.manual_seed(config.seed + global_step * 1000 + idx)
+            latents = torch.randn(1, 16, 1, height_latent, width_latent, device=device, dtype=torch.float32)
+
+            for i, t in enumerate(timesteps):
+                combined = torch.cat([latents, source_5d.unsqueeze(0).to(latents.dtype)], dim=2)
+                timestep_model = (1000 - t.expand(1)) / 1000
+                x_list = [combined[0].to(torch.bfloat16)]
+                # ALL ranks must call transformer forward (FSDP all-gather)
+                model_out_list = transformer(x_list, timestep_model, [cap_feats])[0]
+                noise_pred = model_out_list[0][:, :1, :, :]
+                noise_pred = -noise_pred.float().unsqueeze(0).squeeze(2)
+                latents_2d = latents.squeeze(2)
+                latents_2d = local_scheduler.step(noise_pred.float(), t, latents_2d, return_dict=False)[0]
+                latents = latents_2d.unsqueeze(2)
+
+            # MSE (all ranks can compute)
+            total_mse += F.mse_loss(latents.squeeze(2).squeeze(0).float(), target_latent.float()).item()
+
+            # Only rank 0 decodes and saves images
+            if rank == 0:
+                shift_factor = getattr(_val_vae.config, "shift_factor", 0.0) or 0.0
+                decode_lat = (latents.squeeze(2).to(_val_vae.dtype) / _val_vae.config.scaling_factor) + shift_factor
+                decoded_gen = (_val_vae.decode(decode_lat, return_dict=False)[0] / 2 + 0.5).clamp(0, 1)
+
+                target_dec = (target_latent.unsqueeze(0).to(_val_vae.dtype) / _val_vae.config.scaling_factor) + shift_factor
+                decoded_tgt = (_val_vae.decode(target_dec, return_dict=False)[0] / 2 + 0.5).clamp(0, 1)
+
+                source_dec = (source_latent.unsqueeze(0).to(_val_vae.dtype) / _val_vae.config.scaling_factor) + shift_factor
+                decoded_src = (_val_vae.decode(source_dec, return_dict=False)[0] / 2 + 0.5).clamp(0, 1)
+
+                def to_pil(tensor):
+                    img = tensor[0].cpu().permute(1, 2, 0).float().numpy()
+                    return Image.fromarray((img * 255).round().clip(0, 255).astype("uint8"))
+
+                src_img, gen_img, tgt_img = to_pil(decoded_src), to_pil(decoded_gen), to_pil(decoded_tgt)
+                w, h = src_img.size
+                comparison = Image.new("RGB", (w * 3, h))
+                comparison.paste(src_img, (0, 0))
+                comparison.paste(gen_img, (w, 0))
+                comparison.paste(tgt_img, (w * 2, 0))
+                comparison.save(val_dir / f"{idx:03d}.jpg", quality=90)
+                with open(val_dir / "prompts.txt", "a" if idx > 0 else "w") as f:
+                    f.write(f"{idx:03d}: {sample['prompt']}\n")
+
+    avg_mse = total_mse / n_samples
+    if rank == 0:
+        logger.info(f"[Validate] Avg latent MSE: {avg_mse:.6f}")
+
+    transformer.train()
+    semantic_processor.train()
+    # Restore random state for training
+    torch.manual_seed(config.seed + rank + global_step)
+    return avg_mse if rank == 0 else None
+
+
+# ============================================================================
 # 训练
 # ============================================================================
 
@@ -401,8 +529,6 @@ def train(config: FullParamConfig):
         writer = SummaryWriter(log_dir=str(tb_dir))
         logger.info(f"Training: {config.epochs} epochs, effective batch={config.batch_size * config.gradient_accumulation_steps * world_size}")
 
-    val_vae = None
-    val_scheduler = None
     dist.barrier()
 
     for epoch in range(start_epoch, config.epochs):
@@ -474,28 +600,23 @@ def train(config: FullParamConfig):
                     writer.add_scalar("train/lr", lr, global_step)
                     running_loss = 0.0
 
-                # Validation (rank 0 only, others barrier wait)
+                # Validation: all ranks must participate in FSDP forward (all-gather)
+                # Only rank 0 does VAE decode and saves images
                 if global_step == 1 or global_step % config.validate_every_steps == 0:
-                    if is_main:
-                        if val_vae is None:
-                            from diffusers import AutoencoderKL
-                            from zimage.scheduler import FlowMatchEulerDiscreteScheduler
-                            logger.info("[Validate] Loading VAE...")
-                            val_vae = AutoencoderKL.from_pretrained(
-                                str(model_dir / "vae"), torch_dtype=torch.bfloat16
-                            ).to(device)
-                            val_vae.eval()
-                            val_scheduler = FlowMatchEulerDiscreteScheduler()
-                        val_mse = validate_full(
-                            transformer=transformer,
-                            semantic_processor=semantic_processor.module,
-                            val_dataset=val_dataset,
-                            vae=val_vae, scheduler=val_scheduler, config=config,
-                            global_step=global_step, output_dir=output_dir,
-                            device=device, num_val_steps=10, max_val_samples=config.val_samples_per_run,
-                        )
+                    val_mse = validate_fsdp(
+                        transformer=transformer,
+                        semantic_processor=semantic_processor,
+                        val_dataset=val_dataset,
+                        config=config,
+                        global_step=global_step,
+                        output_dir=output_dir,
+                        device=device,
+                        rank=rank,
+                        world_size=world_size,
+                        model_dir=model_dir,
+                    )
+                    if is_main and val_mse is not None:
                         writer.add_scalar("validation/latent_mse", val_mse, global_step)
-                    dist.barrier()
 
                 # Save checkpoint
                 if global_step % config.save_every_steps == 0:
