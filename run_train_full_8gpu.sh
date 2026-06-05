@@ -7,6 +7,7 @@ set -e
 export NCCL_P2P_DISABLE=0
 export NCCL_IB_DISABLE=0
 export OMP_NUM_THREADS=4
+export NCCL_TIMEOUT=1800
 
 torchrun --nproc_per_node=8 --master_port=29600 \
     train_edit_full.py --train \

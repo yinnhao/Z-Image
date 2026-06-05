@@ -248,7 +248,8 @@ def train(config: FullParamConfig):
     from zimage.transformer import ZImageTransformer2DModel, ZImageTransformerBlock
 
     # --- 分布式初始化 ---
-    dist.init_process_group("nccl")
+    import datetime
+    dist.init_process_group("nccl", timeout=datetime.timedelta(minutes=30))
     local_rank = int(os.environ["LOCAL_RANK"])
     rank = dist.get_rank()
     world_size = dist.get_world_size()
@@ -284,14 +285,17 @@ def train(config: FullParamConfig):
             axes_lens=tc.get("axes_lens", [1536, 512, 512]),
         )
 
-    # Rank 0 加载权重，其他 rank 等 FSDP sync
-    if rank == 0:
-        state_dict = load_sharded_safetensors(transformer_dir, device="cpu", dtype=torch.bfloat16)
-        transformer.load_state_dict(state_dict, strict=False, assign=True)
-        del state_dict
-        logger.info("Transformer weights loaded on rank 0")
-    else:
-        transformer.to_empty(device="cpu")
+    # Rank 0 加载权重，其他 rank 也从磁盘加载（避免 broadcast 超时）
+    if is_main:
+        logger.info("Loading transformer weights...")
+    state_dict = load_sharded_safetensors(transformer_dir, device="cpu", dtype=torch.bfloat16)
+    transformer.load_state_dict(state_dict, strict=False, assign=True)
+    del state_dict
+    if is_main:
+        logger.info("Transformer weights loaded on all ranks")
+
+    # 同步：确保所有 rank 都加载完毕再进入 FSDP
+    dist.barrier()
 
     # ========== 2. FSDP 包裹 Transformer ==========
     auto_wrap_policy = partial(
@@ -310,7 +314,7 @@ def train(config: FullParamConfig):
         sharding_strategy=ShardingStrategy.FULL_SHARD,
         device_id=local_rank,
         use_orig_params=True,
-        sync_module_states=True,
+        sync_module_states=False,
         limit_all_gathers=True,
     )
 
