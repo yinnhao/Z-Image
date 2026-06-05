@@ -37,7 +37,6 @@ from torch.distributed.fsdp import (
     FullStateDictConfig,
 )
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
-from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
@@ -458,9 +457,8 @@ def train(config: FullParamConfig):
 
     transformer.train()
 
-    # ========== 3. SemanticProcessor (DDP) ==========
+    # ========== 3. SemanticProcessor (no DDP — manual grad sync to avoid NCCL conflicts with FSDP) ==========
     semantic_processor = SemanticProcessor(siglip_dim=config.siglip_dim, output_dim=2560).to(device=device, dtype=torch.bfloat16)
-    semantic_processor = DDP(semantic_processor, device_ids=[local_rank])
     semantic_processor.train()
     if is_main:
         sp_params = sum(p.numel() for p in semantic_processor.parameters())
@@ -513,7 +511,7 @@ def train(config: FullParamConfig):
         lr_scheduler.load_state_dict(ckpt["lr_scheduler"])
         # Load semantic processor
         sp_state = torch.load(resume_path / "semantic_processor.pt", map_location=device, weights_only=True)
-        semantic_processor.module.load_state_dict(sp_state)
+        semantic_processor.load_state_dict(sp_state)
         if is_main:
             logger.info(f"Resumed from epoch {start_epoch}, step {global_step}")
 
@@ -585,6 +583,10 @@ def train(config: FullParamConfig):
 
             # Optimizer step on accumulation boundary
             if not is_accumulating:
+                # Manual all-reduce for SemanticProcessor gradients
+                for p in semantic_processor.parameters():
+                    if p.grad is not None:
+                        dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
                 torch.nn.utils.clip_grad_norm_(all_params, config.max_grad_norm)
                 optimizer.step()
                 lr_scheduler.step()
@@ -630,7 +632,7 @@ def train(config: FullParamConfig):
                     ):
                         if is_main:
                             torch.save(transformer.state_dict(), save_dir / "transformer.pt")
-                            torch.save(semantic_processor.module.state_dict(), save_dir / "semantic_processor.pt")
+                            torch.save(semantic_processor.state_dict(), save_dir / "semantic_processor.pt")
                             torch.save({
                                 "epoch": epoch, "global_step": global_step,
                                 "optimizer": optimizer.state_dict(),
@@ -656,7 +658,7 @@ def train(config: FullParamConfig):
     ):
         if is_main:
             torch.save(transformer.state_dict(), final_dir / "transformer.pt")
-            torch.save(semantic_processor.module.state_dict(), final_dir / "semantic_processor.pt")
+            torch.save(semantic_processor.state_dict(), final_dir / "semantic_processor.pt")
             if writer:
                 writer.close()
             logger.info(f"Training complete! Saved to {final_dir}")
