@@ -80,7 +80,7 @@ class EditTrainConfig:
     save_every_steps = 500
     log_every_steps = 10
     validate_every_steps = 200
-    val_samples_per_run = None                      # 每次验证推理多少样本（None=全部验证集）
+    val_samples_per_run = 10                        # 每次验证推理多少样本（None=全部验证集）
     seed = 42
 
     # --- LoRA 配置 ---
@@ -675,12 +675,11 @@ def validate_full(
             cap_feats = torch.cat([text_emb, sem_embed], dim=0)  # [seq+N, 2560]
 
             # 去噪
+            scheduler._step_index = None
             source_5d = source_latent.unsqueeze(1)  # [16, 1, H, W]
             latents = torch.randn(1, 16, 1, height_latent, width_latent, device=device, dtype=torch.float32)
 
             for i, t in enumerate(timesteps):
-                if t == 0 and i == len(timesteps) - 1:
-                    continue
 
                 combined = torch.cat([latents, source_5d.unsqueeze(0).to(latents.dtype)], dim=2)  # [1,16,2,H,W]
                 timestep_model = (1000 - t.expand(1)) / 1000
@@ -1065,7 +1064,7 @@ def train(config: EditTrainConfig):
                     running_loss = 0.0
 
                 # --- 验证（仅 rank 0）：完整推理 100 个验证样本 ---
-                if is_main and global_step % config.validate_every_steps == 0:
+                if is_main and (global_step == 1 or global_step % config.validate_every_steps == 0):
                     # 懒加载 VAE 和 scheduler（首次验证时）
                     if val_vae is None:
                         from diffusers import AutoencoderKL
@@ -1088,7 +1087,7 @@ def train(config: EditTrainConfig):
                         global_step=global_step,
                         output_dir=output_dir,
                         device=device,
-                        num_val_steps=20,
+                        num_val_steps=10,
                         max_val_samples=config.val_samples_per_run,
                     )
                     writer.add_scalar("validation/latent_mse", val_mse, global_step)

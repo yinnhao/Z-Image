@@ -1,0 +1,1 @@
+CUDA_VISIBLE_DEVICES=0 python train_edit_lora.py --train --data_dir /root/paddlejob/workspace/env/vfs_benchmark_cnn/xuziyuan01/zhushou_image_edit_train
