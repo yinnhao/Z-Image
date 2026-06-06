@@ -457,8 +457,15 @@ def train(config: FullParamConfig):
 
     transformer.train()
 
-    # ========== 3. SemanticProcessor (no DDP — manual grad sync to avoid NCCL conflicts with FSDP) ==========
+    # ========== 3. SemanticProcessor (FSDP NO_SHARD to keep collectives in sync) ==========
     semantic_processor = SemanticProcessor(siglip_dim=config.siglip_dim, output_dim=2560).to(device=device, dtype=torch.bfloat16)
+    semantic_processor = FSDP(
+        semantic_processor,
+        mixed_precision=mixed_precision,
+        sharding_strategy=ShardingStrategy.NO_SHARD,
+        device_id=local_rank,
+        use_orig_params=True,
+    )
     semantic_processor.train()
     if is_main:
         sp_params = sum(p.numel() for p in semantic_processor.parameters())
@@ -568,7 +575,7 @@ def train(config: FullParamConfig):
             # Forward + loss (no_sync avoids redundant all-reduce during accumulation)
             is_accumulating = (step + 1) % config.gradient_accumulation_steps != 0
             if is_accumulating:
-                with transformer.no_sync():
+                with transformer.no_sync(), semantic_processor.no_sync():
                     pred_list, _ = transformer(x_list, model_timestep, cap_feats_list)
                     pred = torch.stack([p[:, 0, :, :] for p in pred_list])
                     loss = F.mse_loss(pred.float(), target.float()) / config.gradient_accumulation_steps
@@ -583,10 +590,6 @@ def train(config: FullParamConfig):
 
             # Optimizer step on accumulation boundary
             if not is_accumulating:
-                # Manual all-reduce for SemanticProcessor gradients
-                for p in semantic_processor.parameters():
-                    if p.grad is not None:
-                        dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
                 torch.nn.utils.clip_grad_norm_(all_params, config.max_grad_norm)
                 optimizer.step()
                 lr_scheduler.step()
