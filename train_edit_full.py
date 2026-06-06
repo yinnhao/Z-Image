@@ -250,6 +250,9 @@ def validate_fsdp(
     global _val_vae, _val_scheduler
     from config import BASE_IMAGE_SEQ_LEN, BASE_SHIFT, MAX_IMAGE_SEQ_LEN, MAX_SHIFT
 
+    # Barrier to ensure all ranks finish training step before entering validation
+    dist.barrier()
+
     transformer.eval()
     semantic_processor.eval()
 
@@ -277,6 +280,9 @@ def validate_fsdp(
             ).to(device)
             _val_vae.eval()
             _val_scheduler = FlowMatchEulerDiscreteScheduler()
+
+    # Barrier after VAE loading so all ranks enter denoising loop together
+    dist.barrier()
 
     # All ranks need a scheduler for timestep iteration
     from zimage.scheduler import FlowMatchEulerDiscreteScheduler
@@ -573,9 +579,11 @@ def train(config: FullParamConfig):
             x_list = [x_combined[i] for i in range(B)]
 
             # Forward + loss (no_sync avoids redundant all-reduce during accumulation)
+            # Note: only use no_sync on transformer (FULL_SHARD). SemanticProcessor (NO_SHARD)
+            # always syncs - its 2.6M params cost is negligible and avoids NCCL sequence mismatch.
             is_accumulating = (step + 1) % config.gradient_accumulation_steps != 0
             if is_accumulating:
-                with transformer.no_sync(), semantic_processor.no_sync():
+                with transformer.no_sync():
                     pred_list, _ = transformer(x_list, model_timestep, cap_feats_list)
                     pred = torch.stack([p[:, 0, :, :] for p in pred_list])
                     loss = F.mse_loss(pred.float(), target.float()) / config.gradient_accumulation_steps
