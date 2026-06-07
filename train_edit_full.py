@@ -66,7 +66,7 @@ class FullParamConfig:
     warmup_steps = 500
     max_grad_norm = 1.0
     save_every_steps = 200
-    log_every_steps = 10
+    log_every_steps = 1
     validate_every_steps = 100
     val_samples_per_run = 10
     seed = 42
@@ -300,9 +300,8 @@ def validate_fsdp(
             semantic_feat = sample["semantic_feature"].to(device, dtype=torch.bfloat16)
             text_emb = sample["text_embedding"].to(device, dtype=torch.bfloat16)
 
-            # Semantic processing (DDP module)
-            sp_module = semantic_processor.module if hasattr(semantic_processor, 'module') else semantic_processor
-            sem_embed = sp_module(semantic_feat.unsqueeze(0)).squeeze(0)
+            # Semantic processing (plain module, no wrapper)
+            sem_embed = semantic_processor(semantic_feat.unsqueeze(0)).squeeze(0)
             cap_feats = torch.cat([text_emb, sem_embed], dim=0)
 
             local_scheduler._step_index = None
@@ -463,16 +462,13 @@ def train(config: FullParamConfig):
 
     transformer.train()
 
-    # ========== 3. SemanticProcessor (FSDP NO_SHARD to keep collectives in sync) ==========
+    # ========== 3. SemanticProcessor (plain module, manual grad sync) ==========
+    # NOT wrapped in FSDP/DDP to avoid NCCL collective conflicts with transformer FSDP.
+    # Each rank holds a full copy (only 2.6M params). Gradients are manually all-reduced
+    # at the accumulation boundary using a single fused operation.
     semantic_processor = SemanticProcessor(siglip_dim=config.siglip_dim, output_dim=2560).to(device=device, dtype=torch.bfloat16)
-    semantic_processor = FSDP(
-        semantic_processor,
-        mixed_precision=mixed_precision,
-        sharding_strategy=ShardingStrategy.NO_SHARD,
-        device_id=local_rank,
-        use_orig_params=True,
-    )
     semantic_processor.train()
+
     if is_main:
         sp_params = sum(p.numel() for p in semantic_processor.parameters())
         logger.info(f"SemanticProcessor params: {sp_params:,}")
@@ -578,9 +574,10 @@ def train(config: FullParamConfig):
             x_combined = torch.cat([noisy_target.unsqueeze(2), source_latents.unsqueeze(2)], dim=2)
             x_list = [x_combined[i] for i in range(B)]
 
-            # Forward + loss (no_sync avoids redundant all-reduce during accumulation)
-            # Note: only use no_sync on transformer (FULL_SHARD). SemanticProcessor (NO_SHARD)
-            # always syncs - its 2.6M params cost is negligible and avoids NCCL sequence mismatch.
+            # Forward + loss
+            # SemanticProcessor is a plain module (no FSDP/DDP) — its gradients accumulate
+            # locally without any NCCL ops during backward. This avoids conflicts with
+            # transformer's FSDP ALLGATHER/REDUCE_SCATTER during loss.backward().
             is_accumulating = (step + 1) % config.gradient_accumulation_steps != 0
             if is_accumulating:
                 with transformer.no_sync():
@@ -598,7 +595,33 @@ def train(config: FullParamConfig):
 
             # Optimizer step on accumulation boundary
             if not is_accumulating:
-                torch.nn.utils.clip_grad_norm_(all_params, config.max_grad_norm)
+                # Wait for all FSDP backward operations to fully complete on CUDA
+                # before issuing any new NCCL operations for SemanticProcessor.
+                torch.cuda.synchronize()
+
+                # Manually all-reduce SemanticProcessor gradients as a single fused op.
+                # Flatten all grads → one all-reduce → unflatten back.
+                sp_grads = []
+                sp_shapes = []
+                for p in semantic_processor.parameters():
+                    if p.grad is not None:
+                        sp_grads.append(p.grad.flatten())
+                        sp_shapes.append(p.grad.shape)
+                    else:
+                        sp_grads.append(torch.zeros(p.numel(), device=device, dtype=p.dtype))
+                        sp_shapes.append(p.shape)
+                flat_grads = torch.cat(sp_grads)
+                dist.all_reduce(flat_grads, op=dist.ReduceOp.AVG)
+                # Unflatten back
+                offset = 0
+                for p, shape in zip(semantic_processor.parameters(), sp_shapes):
+                    numel = p.numel()
+                    if p.grad is not None:
+                        p.grad.copy_(flat_grads[offset:offset+numel].view(shape))
+                    offset += numel
+
+                transformer.clip_grad_norm_(config.max_grad_norm)
+                torch.nn.utils.clip_grad_norm_(semantic_processor.parameters(), config.max_grad_norm)
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
@@ -627,6 +650,7 @@ def train(config: FullParamConfig):
                         rank=rank,
                         world_size=world_size,
                         model_dir=model_dir,
+                        max_val_samples=10,
                     )
                     if is_main and val_mse is not None:
                         writer.add_scalar("validation/latent_mse", val_mse, global_step)
@@ -637,12 +661,14 @@ def train(config: FullParamConfig):
                     if is_main:
                         save_dir.mkdir(parents=True, exist_ok=True)
                     # Save full transformer state dict
+                    # ALL ranks must call state_dict() — FSDP needs all-gather from every rank
                     with FSDP.state_dict_type(
                         transformer, StateDictType.FULL_STATE_DICT,
                         FullStateDictConfig(offload_to_cpu=True, rank0_only=True),
                     ):
+                        state_dict = transformer.state_dict()
                         if is_main:
-                            torch.save(transformer.state_dict(), save_dir / "transformer.pt")
+                            torch.save(state_dict, save_dir / "transformer.pt")
                             torch.save(semantic_processor.state_dict(), save_dir / "semantic_processor.pt")
                             torch.save({
                                 "epoch": epoch, "global_step": global_step,
@@ -657,6 +683,7 @@ def train(config: FullParamConfig):
                                 shutil.rmtree(latest, ignore_errors=True)
                             latest.symlink_to(save_dir.resolve())
                             logger.info(f"Saved checkpoint to {save_dir}")
+                        del state_dict
                     dist.barrier()
 
     # ========== 8. Final save ==========
@@ -667,12 +694,14 @@ def train(config: FullParamConfig):
         transformer, StateDictType.FULL_STATE_DICT,
         FullStateDictConfig(offload_to_cpu=True, rank0_only=True),
     ):
+        state_dict = transformer.state_dict()
         if is_main:
-            torch.save(transformer.state_dict(), final_dir / "transformer.pt")
+            torch.save(state_dict, final_dir / "transformer.pt")
             torch.save(semantic_processor.state_dict(), final_dir / "semantic_processor.pt")
             if writer:
                 writer.close()
             logger.info(f"Training complete! Saved to {final_dir}")
+        del state_dict
 
     dist.barrier()
     dist.destroy_process_group()

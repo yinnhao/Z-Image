@@ -4,6 +4,10 @@
 
 set -e
 
+# 激活 conda 环境
+source /root/miniconda3/etc/profile.d/conda.sh
+conda activate qwen_lora
+
 export NCCL_P2P_DISABLE=0
 export NCCL_IB_DISABLE=0
 export OMP_NUM_THREADS=4
