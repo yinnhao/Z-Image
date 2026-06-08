@@ -20,4 +20,4 @@ torchrun --nproc_per_node=8 --master_port=29600 \
     --lr 5e-6 \
     --grad_accum 4 \
     --val_every 100 \
-    --save_every 200
+    --save_every 1000
