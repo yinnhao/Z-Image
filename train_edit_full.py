@@ -61,6 +61,7 @@ class FullParamConfig:
     batch_size = 1
     gradient_accumulation_steps = 4
     learning_rate = 5e-6
+    semantic_learning_rate = 1e-4  # SemanticProcessor 从头训练，用更大学习率
     weight_decay = 0.01
     epochs = 30
     warmup_steps = 500
@@ -493,8 +494,13 @@ def train(config: FullParamConfig):
     )
 
     # ========== 5. Optimizer + Scheduler ==========
-    all_params = list(transformer.parameters()) + list(semantic_processor.parameters())
-    optimizer = torch.optim.AdamW(all_params, lr=config.learning_rate, weight_decay=config.weight_decay)
+    # 差异化学习率：SemanticProcessor 需要较大 LR（从头训练），Transformer 需要较小 LR（保护预训练）
+    transformer_params = list(transformer.parameters())
+    semantic_params = list(semantic_processor.parameters())
+    optimizer = torch.optim.AdamW([
+        {"params": transformer_params, "lr": config.learning_rate},
+        {"params": semantic_params, "lr": config.semantic_learning_rate},
+    ], weight_decay=config.weight_decay)
 
     steps_per_epoch = math.ceil(len(train_dataset) / (config.batch_size * world_size))
     total_steps = config.epochs * steps_per_epoch
@@ -535,6 +541,7 @@ def train(config: FullParamConfig):
         tb_dir = output_dir / "runs"
         writer = SummaryWriter(log_dir=str(tb_dir))
         logger.info(f"Training: {config.epochs} epochs, effective batch={config.batch_size * config.gradient_accumulation_steps * world_size}")
+        logger.info(f"Learning rates: transformer={config.learning_rate:.2e}, semantic_processor={config.semantic_learning_rate:.2e}")
 
     dist.barrier()
 
@@ -885,6 +892,7 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument("--semantic_lr", type=float, default=None)
     parser.add_argument("--grad_accum", type=int, default=None)
     parser.add_argument("--val_every", type=int, default=None)
     parser.add_argument("--save_every", type=int, default=None)
@@ -899,6 +907,8 @@ if __name__ == "__main__":
         config.batch_size = args.batch_size
     if args.lr:
         config.learning_rate = args.lr
+    if args.semantic_lr:
+        config.semantic_learning_rate = args.semantic_lr
     if args.grad_accum:
         config.gradient_accumulation_steps = args.grad_accum
     if args.val_every:
