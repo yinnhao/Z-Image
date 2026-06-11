@@ -7,7 +7,7 @@ set -e
 export https_proxy=http://agent.baidu.com:8891
 export http_proxy=http://agent.baidu.com:8891
 
-DATA_DIR="/root/paddlejob/workspace/env/vfs_benchmark_cnn/xuziyuan01/zhushou_image_edit_train"
+DATA_DIR="/root/paddlejob/workspace/env/vfs_benchmark_cnn/zhuyinghao/online_data_edit"
 PROMPT_LEVEL="medium"
 NUM_SHARDS=8
 LOG_DIR="output/edit_precomputed"

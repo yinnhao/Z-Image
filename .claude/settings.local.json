@@ -28,7 +28,28 @@
       "Bash(for d:*)",
       "Bash(do echo:*)",
       "Read(//root/zyh/Z-Image/output/ablation/**)",
-      "Bash(done)"
+      "Bash(done)",
+      "Bash(curl:*)",
+      "Bash(CUDA_VISIBLE_DEVICES=0 python img2img_inference.py 2>&1)",
+      "Bash(CUDA_VISIBLE_DEVICES=0 python train_edit_lora.py --precompute --data_dir edit_data/ 2>&1)",
+      "Bash(https_proxy=http://agent.baidu.com:8891 http_proxy=http://agent.baidu.com:8891 CUDA_VISIBLE_DEVICES=0 python train_edit_lora.py --precompute --data_dir edit_data/ 2>&1)",
+      "Bash(CUDA_VISIBLE_DEVICES=0 python train_edit_lora.py --train --epochs 5 2>&1)",
+      "Bash(CUDA_VISIBLE_DEVICES=0 python train_edit_lora.py --train --epochs 20 --resolution 512 2>&1 | tail -30)",
+      "Bash(rm:*)",
+      "Bash(https_proxy=http://agent.baidu.com:8891 http_proxy=http://agent.baidu.com:8891 CUDA_VISIBLE_DEVICES=0 python train_edit_lora.py --inference --source input.png --prompt \"turn the netflix logo to green\" --steps 30 --cfg 3.5 2>&1)",
+      "Bash(CUDA_VISIBLE_DEVICES=0 https_proxy=http://agent.baidu.com:8891 http_proxy=http://agent.baidu.com:8891 python train_edit_lora.py --precompute --data_dir /root/paddlejob/workspace/env/vfs_benchmark_cnn/xuziyuan01/zhushou_image_edit_train --max_samples 3 --prompt_level medium 2>&1)",
+      "Bash(https_proxy=http://agent.baidu.com:8891 http_proxy=http://agent.baidu.com:8891 CUDA_VISIBLE_DEVICES=0 python train_edit_lora.py --precompute --data_dir /root/paddlejob/workspace/env/vfs_benchmark_cnn/xuziyuan01/zhushou_image_edit_train --max_samples 6 --shard 1/2 --prompt_level medium 2>&1 | tail -5)",
+      "Bash(kill:*)",
+      "Bash(nvidia-smi:*)",
+      "Bash(pkill:*)",
+      "Bash(bash run_train_8gpu.sh 2>&1 | head -80)",
+      "Bash(bash run_train_8gpu.sh 2>&1 | head -100)",
+      "Bash(bash run_train_8gpu.sh 2>&1 | head -60)",
+      "Bash(head:*)",
+      "Bash(which python:*)",
+      "Bash(echo:*)",
+      "Bash(CUDA_VISIBLE_DEVICES=0 python train_edit_lora.py --train --data_dir /root/paddlejob/workspace/env/vfs_benchmark_cnn/xuziyuan01/zhushou_image_edit_train 2>&1 | head -80)",
+      "Bash(https_proxy=http://agent.baidu.com:8891 http_proxy=http://agent.baidu.com:8891 git push)"
     ]
   }
 }
