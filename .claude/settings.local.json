@@ -50,7 +50,9 @@
       "Bash(echo:*)",
       "Bash(CUDA_VISIBLE_DEVICES=0 python train_edit_lora.py --train --data_dir /root/paddlejob/workspace/env/vfs_benchmark_cnn/xuziyuan01/zhushou_image_edit_train 2>&1 | head -80)",
       "Bash(https_proxy=http://agent.baidu.com:8891 http_proxy=http://agent.baidu.com:8891 git push)",
-      "Bash(grep:*)"
+      "Bash(grep:*)",
+      "Bash(git restore:*)",
+      "Bash(git checkout:*)"
     ]
   }
 }
