@@ -419,9 +419,14 @@ def train(config: FullParamConfig):
         )
 
     # Rank 0 加载权重，其他 rank 也从磁盘加载（避免 broadcast 超时）
+    # 关键：以 fp32 加载，让 FSDP 持有 fp32 主权重（master weights）。
+    # 否则若主权重为 bf16，5e-6 的学习率更新量 (~1e-6) 在加到量级 ~0.1-1.0 的
+    # bf16 权重上会被舍入丢弃（bf16 相对精度仅 ~1/256），导致 loss 不下降、模型不收敛。
+    # MixedPrecision(param_dtype=bf16) 会在前向/反向时临时把权重 cast 成 bf16 计算，
+    # 但优化器始终在 fp32 主权重上更新——这是 FSDP 混合精度全量微调的标准做法。
     if is_main:
-        logger.info("Loading transformer weights...")
-    state_dict = load_sharded_safetensors(transformer_dir, device="cpu", dtype=torch.bfloat16)
+        logger.info("Loading transformer weights (fp32 master for mixed-precision training)...")
+    state_dict = load_sharded_safetensors(transformer_dir, device="cpu", dtype=torch.float32)
     transformer.load_state_dict(state_dict, strict=False, assign=True)
     del state_dict
     if is_main:
@@ -468,6 +473,13 @@ def train(config: FullParamConfig):
     # Each rank holds a full copy (only 2.6M params). Gradients are manually all-reduced
     # at the accumulation boundary using a single fused operation.
     semantic_processor = SemanticProcessor(siglip_dim=config.siglip_dim, output_dim=2560).to(device=device, dtype=torch.bfloat16)
+    # 各 rank 用了不同的 seed (config.seed + rank)，初始化不一致。
+    # 训练时梯度做 all-reduce 平均，但若初始权重不同会导致各卡权重永久不一致、
+    # 训练信号被污染。这里从 rank 0 broadcast 一次，保证所有 rank 初始权重相同。
+    for p in semantic_processor.parameters():
+        dist.broadcast(p.data, src=0)
+    for b in semantic_processor.buffers():
+        dist.broadcast(b.data, src=0)
     semantic_processor.train()
 
     if is_main:
